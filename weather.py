@@ -23,20 +23,50 @@ def get_area_code(location_name: str) -> str:
     # 2. class10s (一次細分区域: 渡島地方、西部など) から検索
     for code, info in area_data.get("class10s", {}).items():
         if location_name in info["name"]:
-            return info["parent"] # 親であるofficesコードを返す
+            return info["parent"]
             
-    # 3. class20s (市町村: 函館市、横浜市など) から検索
-    for code, info in area_data.get("class20s", {}).items():
+    # 3. class15s (市町村等をまとめた地域: 湘南、横浜・川崎など) から検索
+    for code, info in area_data.get("class15s", {}).items():
         if location_name in info["name"]:
-            # 市町村 -> 一次細分区域 -> 府県予報区 と親階層を遡る
             class10_code = info["parent"]
             if class10_code in area_data.get("class10s", {}):
                 return area_data["class10s"][class10_code]["parent"]
 
-    # 4. centers (地方: 北海道地方など) から検索
+    # 4. class20s (市町村: 横浜市、函館市など) から検索
+    # ※罠対策: 部分一致だと「横浜」で青森県の「横浜町」が先にヒットしてしまうため、
+    # まずは「〜市」「〜区」などを補完した完全一致系を優先して検索する
+    exact_match_patterns = [
+        location_name, 
+        f"{location_name}市", 
+        f"{location_name}区", 
+        f"{location_name}町", 
+        f"{location_name}村"
+    ]
+    
+    # 4-1. 完全一致パス
+    for code, info in area_data.get("class20s", {}).items():
+        if info["name"] in exact_match_patterns:
+            parent_code = info["parent"]
+            # 親がclass15sの場合はclass10sへ遡る
+            if parent_code in area_data.get("class15s", {}):
+                parent_code = area_data["class15s"][parent_code]["parent"]
+            # 親がclass10sの場合はofficesへ遡る
+            if parent_code in area_data.get("class10s", {}):
+                return area_data["class10s"][parent_code]["parent"]
+
+    # 4-2. 部分一致パス（完全一致で見つからなかった場合のフォールバック）
+    for code, info in area_data.get("class20s", {}).items():
+        if location_name in info["name"]:
+            parent_code = info["parent"]
+            if parent_code in area_data.get("class15s", {}):
+                parent_code = area_data["class15s"][parent_code]["parent"]
+            if parent_code in area_data.get("class10s", {}):
+                return area_data["class10s"][parent_code]["parent"]
+
+    # 5. centers (地方: 北海道地方など) から検索
     for code, info in area_data.get("centers", {}).items():
         if location_name in info["name"]:
-            return info["children"][0] # その地方に属する最初の府県予報区を返す
+            return info["children"][0]
 
     return None
 
@@ -57,7 +87,7 @@ def get_weather_forecast(location_name: str) -> None:
 
         areas = data[0]["timeSeries"][0]["areas"]
         
-        print(f"【{location_name}の天気予報 (内部エリアコード: {area_code})】")
+        print(f"\n【{location_name}の天気予報 (内部エリアコード: {area_code})】")
         for area in areas:
             area_name = area["area"]["name"]
             weather = area["weathers"][0].replace('　', ' ')
