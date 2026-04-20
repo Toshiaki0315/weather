@@ -5,7 +5,7 @@ import sys
 import re
 
 def get_area_info(input_location: str):
-    """地名からエリアコードとエリア定義データを取得する"""
+    """地名から「大元の県コード」「フィルター用の予報区コード」「エリア定義データ」を取得する"""
     normalized_name = input_location.replace(' ', '').replace('　', '')
     match = re.match(r'^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)(.+)', normalized_name)
     
@@ -25,19 +25,24 @@ def get_area_info(input_location: str):
         print(f"エリア定義データの取得に失敗しました: {e}")
         sys.exit(1)
 
-    # 内部関数: 任意のコードから府県予報区(offices)まで遡る
-    def resolve_office_code(code: str, level: str) -> str:
-        if level == "offices": return code
-        if level == "class10s": return area_data["class10s"][code]["parent"]
-        if level == "class15s":
-            c10 = area_data["class15s"][code]["parent"]
-            return area_data["class10s"][c10]["parent"] if c10 in area_data["class10s"] else None
-        if level == "class20s":
-            parent = area_data["class20s"][code]["parent"]
-            if parent in area_data["class15s"]:
-                parent = area_data["class15s"][parent]["parent"]
-            return area_data["class10s"][parent]["parent"] if parent in area_data["class10s"] else None
-        return None
+    # 内部関数: 検索にヒットした地点が、どの「県(offices)」と「予報区(class10s)」に属するかを辿る
+    def get_codes(code: str, level: str):
+        off_code = None
+        c10_code = None
+        if level == "offices":
+            off_code = code # 県全体が検索された場合は、予報区フィルター(c10_code)はNoneのまま
+        elif level == "class10s":
+            c10_code = code
+            off_code = area_data["class10s"][code]["parent"]
+        elif level == "class15s":
+            c10_code = area_data["class15s"][code]["parent"]
+            off_code = area_data["class10s"][c10_code]["parent"]
+        elif level == "class20s":
+            p = area_data["class20s"][code]["parent"]
+            c10_code = p if p in area_data["class10s"] else area_data["class15s"].get(p, {}).get("parent")
+            if c10_code in area_data["class10s"]:
+                off_code = area_data["class10s"][c10_code]["parent"]
+        return off_code, c10_code
 
     def is_valid_pref(office_code: str) -> bool:
         if not expected_pref or not office_code: return True
@@ -48,40 +53,44 @@ def get_area_info(input_location: str):
         if "沖縄" in expected_pref and office_code.startswith("47"): return True
         return False
 
-    target_code = None
+    target_office = None
+    target_class10 = None
+    
     # 各階層を検索
     for code, info in area_data.get("offices", {}).items():
-        if search_target in info["name"] and is_valid_pref(code): target_code = code; break
-    if not target_code:
+        if search_target in info["name"] and is_valid_pref(code):
+            target_office, target_class10 = get_codes(code, "offices"); break
+    if not target_office:
         for code, info in area_data.get("class10s", {}).items():
             if search_target in info["name"]:
-                off_code = resolve_office_code(code, "class10s")
-                if is_valid_pref(off_code): target_code = off_code; break
-    if not target_code:
+                off, c10 = get_codes(code, "class10s")
+                if is_valid_pref(off): target_office, target_class10 = off, c10; break
+    if not target_office:
         for code, info in area_data.get("class15s", {}).items():
             if search_target in info["name"]:
-                off_code = resolve_office_code(code, "class15s")
-                if is_valid_pref(off_code): target_code = off_code; break
-    if not target_code:
+                off, c10 = get_codes(code, "class15s")
+                if is_valid_pref(off): target_office, target_class10 = off, c10; break
+    if not target_office:
         exact_match_patterns = [search_target, f"{search_target}市", f"{search_target}区", f"{search_target}町", f"{search_target}村"]
         for code, info in area_data.get("class20s", {}).items():
             if info["name"] in exact_match_patterns:
-                off_code = resolve_office_code(code, "class20s")
-                if is_valid_pref(off_code): target_code = off_code; break
-    if not target_code:
+                off, c10 = get_codes(code, "class20s")
+                if is_valid_pref(off): target_office, target_class10 = off, c10; break
+    if not target_office:
         for code, info in area_data.get("class20s", {}).items():
             if search_target in info["name"]:
-                off_code = resolve_office_code(code, "class20s")
-                if is_valid_pref(off_code): target_code = off_code; break
-    if not target_code and not expected_pref:
+                off, c10 = get_codes(code, "class20s")
+                if is_valid_pref(off): target_office, target_class10 = off, c10; break
+    if not target_office and not expected_pref:
         for code, info in area_data.get("centers", {}).items():
-            if search_target in info["name"]: target_code = info["children"][0]; break
+            if search_target in info["name"]: target_office = info["children"][0]; break
 
-    return target_code, area_data
+    # 県コード、フィルターコード、元データの3つを返す
+    return target_office, target_class10, area_data
 
 def get_weather_forecast(location_name: str) -> None:
     print(f"「{location_name}」の天気を取得中...")
-    area_code, area_data = get_area_info(location_name)
+    area_code, filter_code, area_data = get_area_info(location_name)
     
     if not area_code:
         print(f"エラー: 「{location_name}」に対応する地域が見つかりませんでした。")
@@ -94,19 +103,24 @@ def get_weather_forecast(location_name: str) -> None:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode('utf-8'))
 
-        # 各データの格納場所を動的に特定
         weather_series = data[0]["timeSeries"][0]
         pop_series = next((s for s in data[0]["timeSeries"] if "pops" in s["areas"][0]), None)
         temp_series = next((s for s in data[0]["timeSeries"] if "temps" in s["areas"][0]), None)
         
-        # 週間予報（気温補完用）
         weekly_weather_series = data[1]["timeSeries"][0] if len(data) > 1 else None
         weekly_temp_series = next((s for s in data[1]["timeSeries"] if "temps" in s["areas"][0]), None) if len(data) > 1 else None
 
         print(f"\n========== 【{location_name}の天気予報】 ==========")
         
-        # ★ 解決の糸口: enumerateを使ってインデックス(i)を取得し、全ての配列を同じ番号で紐付ける
         for i, w_area in enumerate(weather_series["areas"]):
+            area_code_str = w_area["area"]["code"]
+            
+            # ★ ここがフィルター処理！
+            # 検索した地域が特定の予報区(東部など)に属していて、
+            # なおかつ現在のループが別の予報区(西部など)のデータだった場合は表示をスキップする
+            if filter_code and area_code_str != filter_code:
+                continue
+
             area_name = w_area["area"]["name"]
             
             # 1. 天気
@@ -120,17 +134,14 @@ def get_weather_forecast(location_name: str) -> None:
                 pops = [p for p in p_area.get("pops", []) if p != ""]
                 if pops: pops_str = " / ".join([f"{p}%" for p in pops])
             
-            # 3. 気温 (インデックスで直接紐付け)
+            # 3. 気温
             temps_list = []
-            
-            # A. 短期予報(data[0])の同じインデックスから取得
             if temp_series and i < len(temp_series["areas"]):
                 t_area = temp_series["areas"][i]
                 valid_temps = [t for t in t_area.get("temps", []) if t and t.strip()]
                 if valid_temps:
                     temps_list = valid_temps
 
-            # B. なければ週間予報(data[1])の同じインデックスから補完
             if not temps_list and weekly_temp_series and i < len(weekly_temp_series["areas"]):
                 t_area = weekly_temp_series["areas"][i]
                 valid_temps = [t for t in t_area.get("temps", []) if t and t.strip()]
